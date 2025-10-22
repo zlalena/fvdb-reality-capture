@@ -10,12 +10,10 @@ ENV PATH="/opt/conda/bin:$PATH"
 # Install system dependencies for building
 RUN apt-get update && apt-get install -y \
     build-essential \
+    pkg-config \
     unzip \
     wget \
     gnupg2 \
-    # cmake \
-    # ninja-build \
-    # git \
     && rm -rf /var/lib/apt/lists/*
 
 # Add NVIDIA repository for latest Nsight Systems
@@ -57,6 +55,7 @@ ENV TORCH_CUDA_ARCH_LIST=12.0
 
 # Install PyTorch 2.8 with CUDA 12.8 from PyTorch's official index
 RUN conda run -n benchmark pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+RUN conda run -n benchmark pip install sam2==1.1.0
 
 # Create symlinks for PyTorch libraries so CMake can find them
 RUN ln -sf /opt/conda/envs/benchmark/lib/python3.11/site-packages/torch/lib/libc10.so /opt/conda/envs/benchmark/lib/libc10.so && \

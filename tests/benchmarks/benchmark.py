@@ -12,8 +12,12 @@ import torch.nn.functional as F
 import torch.utils.data
 import yaml
 
+from fvdb_reality_capture.radiance_fields import (
+    GaussianSplatReconstruction,
+    GaussianSplatReconstructionConfig,
+    SfmDataset,
+)
 from fvdb_reality_capture.sfm_scene import SfmScene
-from fvdb_reality_capture.training import Checkpoint, Config, SfmDataset
 
 logger = logging.getLogger("Benchmark 3dgs")
 
@@ -50,7 +54,7 @@ class Benchmark3dgs:
             raise ValueError("No training dataset found in checkpoint")
         train_indices = self.checkpoint.dataset_splits["train"]
 
-        self.config = Config(**self.checkpoint.config)
+        self.config = GaussianSplatReconstructionConfig(**self.checkpoint.config)
         self.train_dataset = SfmDataset(sfm_scene, train_indices)
 
         step = self.checkpoint.step if self.checkpoint.step is not None else 0

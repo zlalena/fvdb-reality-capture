@@ -11,7 +11,7 @@ from ._colmap_utils import Camera as ColmapCamera
 from ._colmap_utils import Image as ColmapImage
 from ._colmap_utils import SceneManager
 from .sfm_cache import SfmCache
-from .sfm_metadata import SfmCameraMetadata, SfmCameraType, SfmImageMetadata
+from .sfm_metadata import SfmCameraMetadata, SfmCameraType, SfmPosedImageMetadata
 
 
 def _distortion_params_from_camera_type(cam: ColmapCamera) -> np.ndarray:
@@ -122,7 +122,7 @@ def load_colmap_scene(colmap_path: pathlib.Path):
 
     cache = SfmCache.get_cache(colmap_path / "_cache", "sfm_dataset_cache", "Cache for SFM dataset")
 
-    logger = logging.getLogger(f"load colmap")  # FIXME: Proper logger name
+    logger = logging.getLogger(f"{__name__}.load_colmap_scene")
 
     image_world_to_cam_mats = []
     image_camera_ids = []
@@ -209,7 +209,7 @@ def load_colmap_scene(colmap_path: pathlib.Path):
 
     # Create ColmapImageMetadata objects for each image
     loaded_images = [
-        SfmImageMetadata(
+        SfmPosedImageMetadata(
             world_to_camera_matrix=image_world_to_cam_mats[i].copy(),
             camera_to_world_matrix=np.linalg.inv(image_world_to_cam_mats[i]).copy(),
             camera_id=image_camera_ids[i],

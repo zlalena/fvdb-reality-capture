@@ -2,20 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-from . import foundation_models, tools, training, transforms, viewer
-from .sfm_scene import SfmCache, SfmCameraMetadata, SfmImageMetadata, SfmScene
+from . import dev, foundation_models, radiance_fields, sfm_scene, tools, transforms
 from .tools import download_example_data
 
 __all__ = [
+    "dev",
     "foundation_models",
+    "radiance_fields",
     "sfm_scene",
     "tools",
-    "training",
     "transforms",
-    "viewer",
     "download_example_data",
-    "SfmScene",
-    "SfmCameraMetadata",
-    "SfmImageMetadata",
-    "SfmCache",
 ]

@@ -7,7 +7,7 @@ name = "fvdb_reality_capture"
 version = "0.0.0"
 description = "fVDB Reality Capture Toolbox."
 authors = [
-    {name = "Fracis Williams", email = "francis@fwilliams.info"},
+    {name = "Francis Williams", email = "francis@fwilliams.info"},
     {name = "Jonathan Swartz", email = "jonathan@jswartz.info"},
     {name = "Mark Harris", email = "MHarris@nvidia.com"},
     {name = "Matthew Cong", email = "mcong@nvidia.com"},
@@ -22,21 +22,29 @@ authors = [
 license="Apache-2.0"
 license-files = ["LICEN[CS]E*"]
 dependencies = [
+    "boto3",
     "dlnr_lite",
     "numpy>=2.0.0",
     "opencv-python-headless",
     "point-cloud-utils",
     "pye57",
     "pyproj",
+    "sam2==1.1.0",
     "scikit-image",
     "scipy",
     "tensorboard",
-    "torch>=2.8.0",
+    "torch>=2.7.0",
     "torchvision",
     "tqdm",
     "tyro",
-    "viser",
+    "usd-core",
+    "msgpack",
+    "types-usd",
 ]
+
+[project.scripts]
+frgs = "fvdb_reality_capture.cli.frgs:frgs"
+frdev = "fvdb_reality_capture.cli.frdev:frdev"
 
 [project.urls]
 Homepage = "https://github.com/openvdb/fvdb-reality-capture"
