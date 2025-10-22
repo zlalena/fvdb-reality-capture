@@ -12,7 +12,7 @@ from fvdb import GaussianSplat3d
 import torch
 import logging
 import argparse
-from ply_to_usdz import export_to_usdz
+from fvdb_reality_capture.tools._export_splats_to_usdz import export_splats_to_usdz
 
 
 def create_rotation_matrix_x(degrees: float) -> np.ndarray:
@@ -300,7 +300,7 @@ def crop_and_convert_splat_to_usdz(
                 new_metadata[key] = value
 
     # Export to USDZ
-    export_to_usdz(model, output_path)  # export_to_usdz already handles Path objects
+    export_splats_to_usdz(model, output_path)  # export_to_usdz already handles Path objects
 
 
 def main():
