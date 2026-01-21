@@ -21,6 +21,8 @@ from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction_writer i
     GaussianSplatReconstructionWriter,
 )
 
+from .contract import validate_benchmark_yaml
+
 logger = logging.getLogger("train benchmark checkpoints")
 
 
@@ -102,6 +104,7 @@ def main(
 
     # Load configuration
     config = load_config(config_path)
+    validate_benchmark_yaml(config)
 
     # data base path
     data_base_path = config["paths"]["data_base"]
