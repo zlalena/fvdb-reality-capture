@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as nnf
 import torch.optim
-from fvdb import GaussianSplat3d
+from fvdb import GaussianSplat3d, morton
 from scipy.special import logit
 
 from fvdb_reality_capture.sfm_scene import SfmScene, SpatialScaleMode
@@ -165,6 +165,12 @@ class GaussianSplatOptimizerConfig:
     to decide whether to split or delete Gaussians that are too large. This behavior is enabled until
     :func:`GaussianSplatOptimizer.refine` has been called ``use_screen_space_scales_for_refinement_until`` times.
     After that, only 3D scales are used for refinement.
+    """
+
+    post_refinement_sort: bool = True
+    """
+    After refining Gaussians, sort them based on their respective Morton codes in order to maximize spatial locality and
+    minimize fragmentation during rasterization.
     """
 
     spatial_scale_mode: SpatialScaleMode = SpatialScaleMode.MEDIAN_CAMERA_DEPTH
@@ -638,6 +644,18 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
 
         if should_reset_opacities:
             self._reset_opacities()
+
+        # Compute normalized Gaussian means in the range of [0, 1 << 21) and their Morton encoding. Sort the Gaussians
+        # based on their respective Morton codes in order to maximize spatial locality and minimize fragmentation.
+        if self._config.post_refinement_sort:
+            bbox_min = torch.min(self._model.means, dim=0).values
+            bbox_max = torch.max(self._model.means, dim=0).values
+            bbox_area = bbox_max - bbox_min
+            normalized_means = (self._model.means - bbox_min) / (bbox_area)
+            ijks = (normalized_means * ((1 << 21) - 1)).to(torch.int32)
+            code = morton(ijks)
+            indices = torch.argsort(code)
+            self.filter_gaussians(indices)
 
         self._refine_count += 1
         self._logger.debug(
