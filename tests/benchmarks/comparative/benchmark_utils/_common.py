@@ -7,11 +7,241 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 from typing import Any
 
 import yaml
+from git import InvalidGitRepositoryError, Repo
+from git.exc import GitCommandError
 
 active_processes = []
+
+
+# =============================================================================
+# Git Utilities
+# =============================================================================
+
+
+def get_git_info(repo_path: pathlib.Path) -> dict[str, Any]:
+    """
+    Get git repository information.
+
+    Args:
+        repo_path: Path to the git repository.
+
+    Returns:
+        Dictionary containing:
+            - commit: Full commit SHA
+            - short_commit: Short commit SHA (first 7 characters)
+            - branch: Current branch name (or None if detached HEAD)
+            - dirty: True if there are uncommitted changes
+            - path: Path to the repository
+    """
+    repo_path = pathlib.Path(repo_path).resolve()
+
+    if not repo_path.exists():
+        return {
+            "commit": None,
+            "short_commit": None,
+            "branch": None,
+            "dirty": None,
+            "path": str(repo_path),
+            "error": f"Repository path does not exist: {repo_path}",
+        }
+
+    try:
+        repo = Repo(repo_path)
+
+        # Get full commit SHA
+        commit = repo.head.commit.hexsha
+
+        # Get short commit
+        short_commit = commit[:7] if commit else None
+
+        # Get current branch (None if detached HEAD)
+        branch = None if repo.head.is_detached else repo.active_branch.name
+
+        # Check if working directory is dirty
+        dirty = repo.is_dirty()
+
+        return {
+            "commit": commit,
+            "short_commit": short_commit,
+            "branch": branch,
+            "dirty": dirty,
+            "path": str(repo_path),
+        }
+
+    except InvalidGitRepositoryError:
+        return {
+            "commit": None,
+            "short_commit": None,
+            "branch": None,
+            "dirty": None,
+            "path": str(repo_path),
+            "error": f"Not a git repository: {repo_path}",
+        }
+    except Exception as e:
+        return {
+            "commit": None,
+            "short_commit": None,
+            "branch": None,
+            "dirty": None,
+            "path": str(repo_path),
+            "error": f"Git error: {e}",
+        }
+
+
+def get_current_commit(repo_path: pathlib.Path) -> str | None:
+    """
+    Get the current HEAD commit SHA for a repository.
+
+    Args:
+        repo_path: Path to the git repository.
+
+    Returns:
+        Full commit SHA, or None if unable to determine.
+    """
+    info = get_git_info(repo_path)
+    return info.get("commit")
+
+
+def checkout_commit(repo_path: pathlib.Path, commit: str) -> bool:
+    """
+    Checkout a specific commit in the repository.
+
+    Args:
+        repo_path: Path to the git repository.
+        commit: Commit SHA to checkout.
+
+    Returns:
+        True if checkout succeeded, False otherwise.
+
+    Raises:
+        RuntimeError: If the working directory has uncommitted changes,
+            to prevent data loss.
+    """
+    repo_path = pathlib.Path(repo_path).resolve()
+
+    try:
+        repo = Repo(repo_path)
+
+        # Check for uncommitted changes before checkout - fail to prevent data loss
+        if repo.is_dirty():
+            raise RuntimeError(
+                f"Repository {repo_path} has uncommitted changes. "
+                "Please commit or stash your changes before running benchmarks "
+                "that require switching commits."
+            )
+
+        # First, fetch to ensure we have the commit
+        logging.info(f"Fetching latest refs in {repo_path}...")
+        try:
+            for remote in repo.remotes:
+                remote.fetch()
+        except GitCommandError:
+            # Don't fail if fetch fails (e.g., no network)
+            logging.warning(f"Fetch failed for {repo_path}, continuing with local refs")
+
+        # Checkout the commit
+        short_commit = commit[:7] if len(commit) >= 7 else commit
+        logging.info(f"Checking out commit {short_commit}... in {repo_path}")
+        repo.git.checkout(commit)
+        return True
+
+    except InvalidGitRepositoryError:
+        logging.error(f"Not a git repository: {repo_path}")
+        return False
+    except GitCommandError as e:
+        logging.error(f"Failed to checkout commit {commit} in {repo_path}: {e}")
+        return False
+    except RuntimeError:
+        # Re-raise RuntimeError for dirty repo (don't catch it here)
+        raise
+
+
+def build_fvdb_core(repo_path: pathlib.Path, verbose: bool = True) -> bool:
+    """
+    Build and install fvdb-core from the given repository path.
+
+    Args:
+        repo_path: Path to the fvdb-core repository.
+        verbose: Whether to show verbose build output.
+
+    Returns:
+        True if build succeeded, False otherwise.
+    """
+    repo_path = pathlib.Path(repo_path).resolve()
+    build_script = repo_path / "build.sh"
+
+    if not build_script.exists():
+        logging.error(f"build.sh not found in {repo_path}")
+        return False
+
+    try:
+        logging.info(f"Building fvdb-core from {repo_path}...")
+        cmd = ["./build.sh", "install"]
+        if verbose:
+            cmd.append("verbose")
+
+        # Set up environment
+        env = os.environ.copy()
+        # Preserve important CUDA environment variables
+        for var in ["TORCH_CUDA_ARCH_LIST", "CUDAARCHS", "CPM_SOURCE_CACHE"]:
+            if var in os.environ:
+                env[var] = os.environ[var]
+
+        subprocess.run(
+            cmd,
+            cwd=repo_path,
+            env=env,
+            check=True,
+            capture_output=not verbose,
+        )
+        logging.info("fvdb-core build completed successfully")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to build fvdb-core: {e}")
+        if e.stdout:
+            logging.error(f"Build stdout: {e.stdout.decode('utf-8')}")
+        if e.stderr:
+            logging.error(f"Build stderr: {e.stderr.decode('utf-8')}")
+        return False
+
+
+def install_python_package(repo_path: pathlib.Path, editable: bool = False) -> bool:
+    """
+    Install a Python package from the given repository path.
+
+    Args:
+        repo_path: Path to the repository containing pyproject.toml or setup.py.
+        editable: Whether to install in editable mode (-e).
+
+    Returns:
+        True if installation succeeded, False otherwise.
+    """
+    repo_path = pathlib.Path(repo_path).resolve()
+
+    try:
+        logging.info(f"Installing Python package from {repo_path}...")
+        cmd = [sys.executable, "-m", "pip", "install"]
+        if editable:
+            cmd.extend(["-e", str(repo_path)])
+        else:
+            cmd.append(str(repo_path))
+
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        logging.info(f"Package installation from {repo_path} completed successfully")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to install package from {repo_path}: {e}")
+        if e.stdout:
+            logging.error(f"Install stdout: {e.stdout}")
+        if e.stderr:
+            logging.error(f"Install stderr: {e.stderr}")
+        return False
 
 
 def setup_signal_handlers():
@@ -261,7 +491,10 @@ def extract_training_metrics(output: str, total_time: float) -> dict[str, Any]:
 
 
 def run_command(
-    cmd: list[str], cwd: str | None = None, env: dict[str, Any] | None = None, log_file: str | None = None
+    cmd: list[str],
+    cwd: str | None = None,
+    env: dict[str, Any] | None = None,
+    log_file: str | None = None,
 ) -> tuple[int, str, str]:
     """
     Run a command in a subprocess and return exit code, stdout, and stderr.
@@ -391,7 +624,11 @@ def run_command(
                 if return_code == 0:
                     return return_code, "Process completed successfully", ""
                 else:
-                    return return_code, "", f"Process failed with exit code {return_code}"
+                    return (
+                        return_code,
+                        "",
+                        f"Process failed with exit code {return_code}",
+                    )
 
             except KeyboardInterrupt:
                 logging.info("Received interrupt signal, terminating process...")

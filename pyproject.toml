@@ -47,6 +47,11 @@ dependencies = [
     "types-usd",
 ]
 
+[project.optional-dependencies]
+benchmark = [
+    "gitpython",
+]
+
 [project.scripts]
 frgs = "fvdb_reality_capture.cli.frgs:frgs"
 frdev = "fvdb_reality_capture.cli.frdev:frdev"
