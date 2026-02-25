@@ -157,11 +157,8 @@ def run_gsplat_training(
     refine_stop_steps = params["refine_stop_steps"]
     refine_every_steps = params["refine_every_steps"]
     sh_degree_interval_steps = params["sh_degree_interval_steps"]
-
-    # Calculate reset_every_steps (convert reset_opacities_every_epoch to steps)
-    reset_opacities_every_epoch = 16  # From benchmark_config.yaml
-    training_images = params["training_images"]
-    reset_every_steps = int(reset_opacities_every_epoch * training_images)
+    reset_every_steps = params["reset_every_steps"]
+    refine_scale2d_stop_steps = params["refine_scale2d_stop_steps"]
 
     # Save the filtered config
     with open(temp_config_path, "w") as f:
@@ -172,8 +169,9 @@ def run_gsplat_training(
     logging.info(f"  refine_start_steps: {refine_start_steps}")
     logging.info(f"  refine_stop_steps: {refine_stop_steps}")
     logging.info(f"  refine_every_steps: {refine_every_steps}")
-    logging.info(f"  reset_every_steps: {reset_every_steps}")
     logging.info(f"  sh_degree_interval_steps: {sh_degree_interval_steps}")
+    logging.info(f"  reset_every_steps: {reset_every_steps}")
+    logging.info(f"  refine_scale2d_stop_steps: {refine_scale2d_stop_steps}")
     logging.info(f"  Training images: {training_images}")
     logging.info(f"  Total images: {params.get('total_images', 'N/A')}")
 
@@ -234,7 +232,7 @@ def run_gsplat_training(
             str(refine_stop_steps),
             "--strategy.refine_every",
             str(refine_every_steps),
-            "--strategy.verbose",  # Enable verbose output to see refinement info
+            "--strategy.verbose",
             "--global_scale",
             "1.0",
         ]
@@ -244,10 +242,8 @@ def run_gsplat_training(
             [
                 "--strategy.reset_every",
                 str(reset_every_steps),
-                "--strategy.pause_refine_after_reset",
-                "0",
                 "--strategy.refine_scale2d_stop_iter",
-                "1",  # Disable 2D scale-based splitting to match FVDB behavior
+                str(refine_scale2d_stop_steps),
             ]
         )
 
