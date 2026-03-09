@@ -1,0 +1,91 @@
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+# ARG OPENMVS_GIT_COMMIT=v2.3.0
+ARG COLMAP_GIT_COMMIT=3.13.0
+ARG EIGEN_GIT_COMMIT=3.4.0
+# ARG CERES_GIT_COMMIT=2.2.0 NOTE have to use main branch for now for cuDSS solver support
+ARG CUDA_ARCHITECTURES=89
+ENV QT_XCB_GL_INTEGRATION=xcb_egl
+# Prevent stop building ubuntu at time zone selection.
+ENV DEBIAN_FRONTEND=noninteractive
+# Prepare and empty machine for building.
+RUN apt-get update
+RUN apt-get -y upgrade
+RUN apt-get install -y \
+    git \
+    wget \
+    cmake \
+    ninja-build \
+    build-essential \
+    libboost-program-options-dev \
+    libboost-filesystem-dev \
+    libboost-graph-dev \
+    libboost-system-dev \
+    libeigen3-dev \
+    libflann-dev \
+    libfreeimage-dev \
+    libmetis-dev \
+    libgoogle-glog-dev \
+    libgtest-dev \
+    libsqlite3-dev \
+    libglew-dev \
+    qtbase5-dev \
+    libqt5opengl5-dev \
+    libcgal-dev \
+    libgflags-dev \
+    libatlas-base-dev \
+    libsuitesparse-dev
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+RUN dpkg -i cuda-keyring_1.1-1_all.deb
+RUN apt-get update
+RUN apt-get -y install cudss
+# CGAL
+RUN apt-get -yq install \
+    libcgal-dev \
+    libcgal-qt5-dev
+# Boost
+RUN apt-get -y install \
+    libboost-iostreams-dev \
+    libboost-program-options-dev \
+    libboost-system-dev \
+    libboost-serialization-dev
+RUN set -xe \
+&& apt-get update \
+&& apt-get install python3-pip -y
+RUN pip install --upgrade pip
+RUN ldconfig
+# Install newer version of CMake
+RUN wget https://github.com/Kitware/CMake/releases/download/v3.30.1/cmake-3.30.1-linux-x86_64.sh && \
+    chmod +x cmake-3.30.1-linux-x86_64.sh && \
+    ./cmake-3.30.1-linux-x86_64.sh --skip-license --prefix=/usr/local
+# Eigen
+RUN git clone https://gitlab.com/libeigen/eigen --branch ${EIGEN_GIT_COMMIT} && \
+    mkdir eigen_build && \
+    cd eigen_build && \
+    cmake . ../eigen -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda/ && \
+    make && make install && \
+    cd .. && rm -rf eigen_build eigen
+# Build and install Ceres solver with GPU support, patching cmakelists to correct cuda architecture
+RUN git clone https://ceres-solver.googlesource.com/ceres-solver
+RUN cd ceres-solver && \
+    # git fetch https://ceres-solver.googlesource.com/ceres-solver ${CERES_GIT_COMMIT} && \
+    # git checkout FETCH_HEAD && \
+    git submodule update --init --recursive && \
+    # patch CMakeLists.txt for correct cuda
+    sed -i '/^\s*list(APPEND CMAKE_CUDA_ARCHITECTURES "90")/i \          list(APPEND CMAKE_CUDA_ARCHITECTURES "'$CUDA_ARCHITECTURES'")' CMakeLists.txt && \
+    mkdir build && \
+    cd build && \
+    cmake .. -DUSE_CUDA=ON -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF && \
+    make -j && \
+    make install && \
+    cd ../../ && rm -rf ceres-solver
+# Build and install COLMAP.
+RUN git clone https://github.com/colmap/colmap.git
+RUN cd colmap && \
+    git fetch https://github.com/colmap/colmap.git ${COLMAP_GIT_COMMIT} && \
+    git checkout FETCH_HEAD && \
+    mkdir build && \
+    cd build && \
+    cmake .. -GNinja -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} && \
+    ninja && \
+    ninja install && \
+    cd ../../ && rm -rf colmap
