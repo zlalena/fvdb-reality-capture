@@ -1,0 +1,63 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+
+ARG COLMAP_GIT_COMMIT=3.13.0
+ARG CUDA_ARCHITECTURES=89
+ENV QT_XCB_GL_INTEGRATION=xcb_egl
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies in one go with retries
+RUN for i in 1 2 3; do \
+        apt-get update && \
+        apt-get install -y \
+        git cmake ninja-build build-essential \
+        libboost-all-dev \
+        libeigen3-dev libflann-dev libfreeimage-dev libmetis-dev \
+        libgoogle-glog-dev libgtest-dev libgmock-dev libsqlite3-dev \
+        libglew-dev qtbase5-dev libqt5opengl5-dev libcgal-dev \
+        libgflags-dev libatlas-base-dev libsuitesparse-dev \
+        python3-pip wget ca-certificates \
+        && break || sleep 15; \
+    done && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip3 install --no-cache-dir --upgrade pip
+
+# Install Ceres Solver from source (needed for COLMAP with GPU support)
+RUN git clone https://ceres-solver.googlesource.com/ceres-solver && \
+    cd ceres-solver && \
+    git submodule update --init --recursive && \
+    cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DUSE_CUDA=ON \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_EXAMPLES=OFF && \
+    cmake --build build --parallel $(nproc) && \
+    cmake --install build && \
+    cd .. && rm -rf ceres-solver
+
+# Build and install COLMAP 3.13.0
+RUN git clone https://github.com/colmap/colmap.git && \
+    cd colmap && \
+    git checkout ${COLMAP_GIT_COMMIT} && \
+    cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
+        -DGUI_ENABLED=OFF && \
+    cmake --build build --parallel $(nproc) && \
+    cmake --install build && \
+    cd .. && rm -rf colmap
+
+# Copy COLMAP pipeline script
+COPY run.py /workspace/run.py
+RUN chmod +x /workspace/run.py
+
+# Set working directory
+WORKDIR /workspace
+
+# Set environment
+ENV PYTHONUNBUFFERED=1
+
+# Default command
+CMD ["/bin/bash"]
