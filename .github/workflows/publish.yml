@@ -92,9 +92,7 @@ jobs:
           grep '^version' pyproject.toml
 
       - name: Build sdist and wheel
-        run: |
-          uv pip install build
-          uv run python -m build
+        run: uv build
 
       - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
@@ -335,10 +333,20 @@ jobs:
           # Extract base version (e.g. 0.4.0) from the wheel filename
           CORE_VERSION=$(echo "$WHEEL" | grep -oP 'fvdb_core-\K[0-9]+\.[0-9]+\.[0-9]+')
 
-          # Build direct download URL for cp312 wheel (+ must be %2B in S3 URLs)
-          S3_BASE="https://fvdb-packages.s3.us-east-2.amazonaws.com/simple-staging/fvdb-core"
           LOCAL_TAG_CLEAN=$(echo "$LOCAL_TAG" | sed 's/^+//')
-          CORE_WHEEL_URL="${S3_BASE}/fvdb_core-${CORE_VERSION}%2B${LOCAL_TAG_CLEAN}-cp312-cp312-manylinux_2_28_x86_64.whl"
+
+          # Find the actual cp312 wheel from the listing (platform tag varies across builds)
+          CP312_WHEEL=$(echo "$LISTING" | grep "fvdb_core-${CORE_VERSION}+${LOCAL_TAG_CLEAN}-cp312-cp312-" | head -1)
+          if [ -z "$CP312_WHEEL" ]; then
+            echo "ERROR: No cp312 fvdb-core wheel found for version ${CORE_VERSION}+${LOCAL_TAG_CLEAN}" >&2
+            echo "Available wheels:" >&2
+            echo "$LISTING" >&2
+            exit 1
+          fi
+
+          S3_BASE="https://fvdb-packages.s3.us-east-2.amazonaws.com/simple-staging/fvdb-core"
+          CP312_ENCODED=$(echo "$CP312_WHEEL" | sed 's/+/%2B/g')
+          CORE_WHEEL_URL="${S3_BASE}/${CP312_ENCODED}"
 
           echo "Discovered: torch=$TORCH_VERSION cuda=$CUDA_TAG image=$CUDA_IMAGE_TAG"
           echo "Core wheel URL: $CORE_WHEEL_URL"
@@ -443,13 +451,14 @@ jobs:
       image: nvidia/cuda:${{ needs.discover-fvdb-core.outputs.cuda-image-tag }}-base-rockylinux8
       env:
         PYTHONPATH: ""
+        SSL_CERT_FILE: /etc/pki/tls/certs/ca-bundle.crt
       options: --rm
     defaults:
       run:
         shell: bash -el {0}
     steps:
       - name: Install prerequisites
-        run: dnf install -y git wget procps-ng findutils
+        run: dnf install -y git wget procps-ng findutils ca-certificates
 
       - uses: actions/checkout@v4
         with:
@@ -494,7 +503,7 @@ jobs:
       - name: Run unit and benchmark contract tests
         run: |
           cd tests
-          uv run pytest -v unit benchmarks/test_benchmark_contract.py benchmarks/test_comparison_benchmark.py
+          ../.venv/bin/python -m pytest -v unit benchmarks/test_benchmark_contract.py benchmarks/test_comparison_benchmark.py
 
   stop-validation-runner:
     name: Stop GPU EC2 runner for validation
