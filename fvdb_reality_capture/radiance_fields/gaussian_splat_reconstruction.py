@@ -12,8 +12,9 @@ import numpy as np
 import torch
 import torch.nn.functional as nnf
 import torch.utils.data
+from torch.utils import _pytree
 import tqdm
-from fvdb import GaussianSplat3d, ProjectionType
+from fvdb import GaussianSplat3d
 from fvdb.utils.metrics import psnr, ssim
 from fvdb.viz import Scene
 from scipy.spatial import cKDTree  # type: ignore
@@ -21,6 +22,7 @@ from scipy.spatial import cKDTree  # type: ignore
 from fvdb_reality_capture.sfm_scene import SfmScene
 from fvdb_reality_capture.tools import export_splats_to_usdz
 
+from ._gaussian_rendering import RenderBackend, make_render_backend
 from ._private.lpips import LPIPSLoss
 from ._private.utils import crop_image_batch
 from .camera_pose_adjust import CameraPoseAdjustment
@@ -127,21 +129,6 @@ class GaussianSplatReconstructionConfig:
     until we reach :obj:`sh_degree`. This helps stabilize optimization in the early stages of optimization.
 
     Default: ``5``
-    """
-
-    initial_opacity: float = 0.1
-    """
-    Initial opacity of each Gaussian. This is the alpha value used when rendering the Gaussians at the start of optimization.
-
-    Default: ``0.1``
-    """
-
-    initial_covariance_scale: float = 1.0
-    """
-    Initial scale of each Gaussian. This controls the initial size of the Gaussians in the scene.
-    Each Gaussian's covariance matrix will be initialized to a diagonal matrix with this value on the diagonal.
-
-    Default: ``1.0``
     """
 
     ssim_lambda: float = 0.2
@@ -317,6 +304,20 @@ class GaussianSplatReconstructionConfig:
     Default: ``16``
     """
 
+    render_backend: Literal["image_space", "world_space"] = "image_space"
+    """
+    Rendering path to use during reconstruction.
+
+    Default: ``"image_space"``
+    """
+
+    projection_method: Literal["auto", "analytic", "unscented"] = "auto"
+    """
+    Projection implementation selector for FVDB camera models.
+
+    Default: ``"auto"``
+    """
+
 
 class GaussianSplatReconstruction:
     """
@@ -356,6 +357,29 @@ class GaussianSplatReconstruction:
     _magic = "GaussianSplattingCheckpoint"
 
     __PRIVATE__ = object()
+
+    @staticmethod
+    def _move_state_tensors_to_device(obj: Any, device: torch.device) -> Any:
+        """
+        Move all tensors in a checkpoint payload to the requested device.
+
+        Checkpoints can be loaded on CPU and later restored onto CUDA via ``from_state_dict``.
+        We detach before moving so floating-point tensors become leaf tensors again on the
+        destination device; otherwise optimizer reconstruction can fail when PyTorch rejects
+        non-leaf tensors in parameter groups.
+        """
+
+        def _move_leaf_tensor(value: Any) -> Any:
+            if not isinstance(value, torch.Tensor):
+                return value
+
+            moved = value.detach().to(device)
+            if moved.is_floating_point() or moved.is_complex():
+                moved.requires_grad_(value.requires_grad)
+            return moved
+
+        # Apply the tensor move/releaf logic to every leaf in the nested checkpoint payload.
+        return _pytree.tree_map(_move_leaf_tensor, obj)
 
     @classmethod
     def from_sfm_scene(
@@ -419,21 +443,35 @@ class GaussianSplatReconstruction:
         logger.info(
             f"Created training and validation datasets with {len(train_dataset)} training images and {len(val_dataset)} validation images."
         )
+        if config.optimize_camera_poses and len(val_dataset) > 0:
+            logger.warning(
+                "Camera pose optimization is enabled with a holdout set. Pose deltas are learned from training images "
+                "only, while validation images continue to use their original camera poses, so validation metrics may "
+                "not reflect the train-time objective."
+            )
 
         # Initialize model
-        model = GaussianSplatReconstruction._init_model(config, device, train_dataset)
+        model = GaussianSplatReconstruction._init_model(config, optimizer_config, device, train_dataset)
         logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
+
+        render_backend = make_render_backend(config.render_backend)
+        render_backend.validate_scene_cameras(model, train_dataset, config, torch.device(device))
 
         # Initialize optimizer
         max_steps = config.max_epochs * len(train_dataset)
         optimizer = optimizer_config.make_optimizer(model=model, sfm_scene=train_dataset.sfm_scene)
         optimizer.reset_learning_rates_and_decay(batch_size=config.batch_size, expected_steps=max_steps)
 
+        if config.batch_size > 1:
+            num_steps_per_epoch = int(np.ceil(len(train_dataset) / config.batch_size))
+        else:
+            num_steps_per_epoch = len(train_dataset)
+
         # Initialize pose optimizer
         pose_adjust_model, pose_adjust_optimizer, pose_adjust_scheduler = None, None, None
         if config.optimize_camera_poses:
             pose_adjust_model, pose_adjust_optimizer, pose_adjust_scheduler = cls._make_pose_optimizer(
-                config, device, len(train_dataset)
+                config, device, sfm_scene.num_images, num_steps_per_epoch
             )
 
         return GaussianSplatReconstruction(
@@ -451,6 +489,7 @@ class GaussianSplatReconstruction:
             viz_scene=viz_scene,
             log_interval_steps=log_interval_steps,
             viz_update_interval_epochs=viz_update_interval_epochs,
+            render_backend=render_backend,
             _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
@@ -490,6 +529,7 @@ class GaussianSplatReconstruction:
             device (str | torch.device): Device to run the reconstruction on.
         """
         logger = logging.getLogger(f"{cls.__module__}.{cls.__name__}")
+        device = torch.device(device)
 
         # Ensure this is a valid state dict
         if state_dict.get("magic", "") != cls._magic:
@@ -526,25 +566,39 @@ class GaussianSplatReconstruction:
             raise ValueError("Checkpoint is missing pose_adjust_scheduler key.")
 
         global_step = state_dict["step"]
-        config = GaussianSplatReconstructionConfig(**state_dict["config"])
+        config_state = dict(state_dict["config"])
+        config_state.pop("undistort_images", None)
+        legacy_initial_opacity = config_state.pop("initial_opacity", None)
+        legacy_initial_covariance_scale = config_state.pop("initial_covariance_scale", None)
+        config = GaussianSplatReconstructionConfig(**config_state)
 
         np.random.seed(config.seed)
         random.seed(config.seed)
         torch.manual_seed(config.seed)
 
+        sfm_scene: SfmScene
         if override_sfm_scene is not None:
-            sfm_scene: SfmScene = override_sfm_scene
+            sfm_scene = override_sfm_scene
             logger.info("Using override SfM scene instead of the one from the checkpoint.")
         else:
-            sfm_scene: SfmScene = SfmScene.from_state_dict(state_dict["sfm_scene"])
+            sfm_scene = SfmScene.from_state_dict(state_dict["sfm_scene"])
         if override_use_every_n_as_val is not None:
             train_indices, val_indices = cls._make_index_splits(sfm_scene, override_use_every_n_as_val)
         else:
             train_indices = np.array(state_dict["train_indices"], dtype=int)
             val_indices = np.array(state_dict["val_indices"], dtype=int)
-        model = GaussianSplat3d.from_state_dict(state_dict["model"])
-        optimizer = BaseGaussianSplatOptimizer.from_state_dict(model, state_dict["optimizer"])
-        num_training_poses = state_dict["num_training_poses"]
+        model_state = cls._move_state_tensors_to_device(state_dict["model"], device)
+        model = GaussianSplat3d.from_state_dict(model_state)
+        optimizer_state = dict(state_dict["optimizer"])
+        optimizer_config_state = dict(optimizer_state.get("config", {}))
+        if "initial_opacity" not in optimizer_config_state and legacy_initial_opacity is not None:
+            optimizer_config_state["initial_opacity"] = legacy_initial_opacity
+        if "initial_covariance_scale" not in optimizer_config_state and legacy_initial_covariance_scale is not None:
+            optimizer_config_state["initial_covariance_scale"] = legacy_initial_covariance_scale
+        optimizer_state["config"] = optimizer_config_state
+        optimizer_state = cls._move_state_tensors_to_device(optimizer_state, device)
+        optimizer = BaseGaussianSplatOptimizer.from_state_dict(model, optimizer_state)
+        num_pose_entries = state_dict["num_training_poses"]
         pose_adjust_model, pose_adjust_optimizer, pose_adjust_scheduler = None, None, None
 
         if state_dict["pose_adjust_model"] is not None:
@@ -554,12 +608,35 @@ class GaussianSplatReconstruction:
                 raise ValueError("Checkpoint pose adjustment optimizer state is invalid.")
             if not isinstance(state_dict.get("pose_adjust_scheduler", None), dict):
                 raise ValueError("Checkpoint pose adjustment scheduler state is invalid.")
+            pose_adjust_model_state = cls._move_state_tensors_to_device(state_dict["pose_adjust_model"], device)
+            pose_adjust_optimizer_state = cls._move_state_tensors_to_device(state_dict["pose_adjust_optimizer"], device)
+            pose_adjust_scheduler_state = cls._move_state_tensors_to_device(state_dict["pose_adjust_scheduler"], device)
+            if config.batch_size > 1:
+                num_steps_per_epoch = int(np.ceil(len(train_indices) / config.batch_size))
+            else:
+                num_steps_per_epoch = len(train_indices)
             pose_adjust_model, pose_adjust_optimizer, pose_adjust_scheduler = cls._make_pose_optimizer(
-                config, device, num_training_poses
+                config, device, sfm_scene.num_images, num_steps_per_epoch
             )
-            pose_adjust_model.load_state_dict(state_dict["pose_adjust_model"])
-            pose_adjust_optimizer.load_state_dict(state_dict["pose_adjust_optimizer"])
-            pose_adjust_scheduler.load_state_dict(state_dict["pose_adjust_scheduler"])
+            pose_embedding_weights = pose_adjust_model_state["pose_embeddings.weight"]
+            if pose_embedding_weights.shape[0] == sfm_scene.num_images:
+                pose_adjust_model.load_state_dict(pose_adjust_model_state)
+                pose_adjust_optimizer.load_state_dict(pose_adjust_optimizer_state)
+                pose_adjust_scheduler.load_state_dict(pose_adjust_scheduler_state)
+            elif pose_embedding_weights.shape[0] == len(train_indices) and num_pose_entries == len(train_indices):
+                logger.warning(
+                    "Loading legacy checkpoint with training-local pose IDs. Remapping pose deltas to scene-global IDs "
+                    "and reinitializing pose optimizer state."
+                )
+                with torch.no_grad():
+                    pose_adjust_model.pose_embeddings.weight.zero_()
+                    pose_adjust_model.pose_embeddings.weight[
+                        torch.as_tensor(train_indices, dtype=torch.long, device=device)
+                    ] = pose_embedding_weights.to(device)
+            else:
+                raise ValueError(
+                    "Checkpoint pose adjustment table size does not match either the full scene or the training split."
+                )
 
         return GaussianSplatReconstruction(
             model=model,
@@ -576,6 +653,7 @@ class GaussianSplatReconstruction:
             viz_scene=viz_scene,
             log_interval_steps=log_interval_steps,
             viz_update_interval_epochs=viz_update_interval_epochs,
+            render_backend=make_render_backend(config.render_backend),
             _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
@@ -595,6 +673,7 @@ class GaussianSplatReconstruction:
         viz_scene: Scene | None,
         log_interval_steps: int,
         viz_update_interval_epochs: float,
+        render_backend: RenderBackend,
         _private: object | None = None,
     ) -> None:
         """
@@ -636,6 +715,7 @@ class GaussianSplatReconstruction:
         self._pose_adjust_scheduler = pose_adjust_scheduler
         self._start_step = start_step
         self._viz_update_interval_epochs = viz_update_interval_epochs
+        self._render_backend = render_backend
 
         self._sfm_scene = sfm_scene
         self._training_dataset = SfmDataset(
@@ -646,6 +726,7 @@ class GaussianSplatReconstruction:
         self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
 
         self.device: torch.device = model.device
+        self._render_backend.validate_scene_cameras(self._model, self._training_dataset, self._cfg, self.device)
 
         self._global_step: int = 0
 
@@ -697,7 +778,7 @@ class GaussianSplatReconstruction:
         * ``"optimizer"``: The state dictionary of the optimizer.
         * ``"train_indices"``: The indices of the training images in the dataset.
         * ``"val_indices"``: The indices of the validation images in the dataset.
-        * ``"num_training_poses"``: The number of training poses if pose adjustment is used, otherwise None.
+        * ``"num_training_poses"``: Legacy checkpoint key storing the number of pose entries if pose adjustment is used, otherwise None.
         * ``"pose_adjust_model"``: The state dictionary of the camera pose adjustment model if used, otherwise None.
         * ``"pose_adjust_optimizer"``: The state dictionary of the pose adjustment optimizer if used, otherwise None.
         * ``"pose_adjust_scheduler"``: The state dictionary of the pose adjustment scheduler if used, otherwise None.
@@ -770,12 +851,15 @@ class GaussianSplatReconstruction:
         )[self._training_dataset.indices]
         if self.pose_adjust_model is not None:
             training_camera_to_world_matrices = self.pose_adjust_model(
-                training_camera_to_world_matrices, torch.arange(len(self.training_dataset), device=self.device)
+                training_camera_to_world_matrices,
+                torch.as_tensor(self._training_dataset.indices, dtype=torch.long, device=self.device),
             )
 
         # Save projection parameters as a per-camera tuple (fx, fy, cx, cy, h, w)
         training_projection_matrices = torch.from_numpy(self._training_dataset.projection_matrices.astype(np.float32))
         training_image_sizes = torch.from_numpy(self._training_dataset.image_sizes.astype(np.int32))
+        training_camera_models = torch.from_numpy(self._training_dataset.camera_models.astype(np.int32))
+        training_distortion_coeffs = torch.from_numpy(self._training_dataset.distortion_coeffs.astype(np.float32))
         normalization_transform = torch.from_numpy(self.training_dataset.sfm_scene.transformation_matrix).to(
             torch.float32
         )
@@ -785,6 +869,8 @@ class GaussianSplatReconstruction:
             "camera_to_world_matrices": training_camera_to_world_matrices,
             "projection_matrices": training_projection_matrices,
             "image_sizes": training_image_sizes,
+            "camera_models": training_camera_models,
+            "distortion_coeffs": training_distortion_coeffs,
             "median_depths": training_median_depths,
             "eps2d": self.config.eps_2d,
             "near_plane": self.config.near_plane,
@@ -792,6 +878,8 @@ class GaussianSplatReconstruction:
             "min_radius_2d": self.config.min_radius_2d,
             "antialias": int(self.config.antialias),
             "tile_size": self.config.tile_size,
+            "projection_method": self.config.projection_method,
+            "render_backend": self.config.render_backend,
         }
 
     @property
@@ -877,6 +965,7 @@ class GaussianSplatReconstruction:
     @staticmethod
     def _init_model(
         config: GaussianSplatReconstructionConfig,
+        optimizer_config: GaussianSplatOptimizerConfig,
         device: torch.device | str,
         training_dataset: SfmDataset,
     ):
@@ -903,11 +992,16 @@ class GaussianSplatReconstruction:
 
         dist2_avg = (_knn(training_dataset.points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
         dist_avg = torch.sqrt(dist2_avg)
-        log_scales = torch.log(dist_avg * config.initial_covariance_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+
+        log_scales = (
+            torch.log(dist_avg * optimizer_config.initial_covariance_scale).unsqueeze(-1).repeat(1, 3)
+        )  # [N, 3]
 
         means = torch.from_numpy(training_dataset.points).to(device=device, dtype=torch.float32)  # [N, 3]
         quats = torch.rand((num_gaussians, 4), device=device)  # [N, 4]
-        logit_opacities = torch.logit(torch.full((num_gaussians,), config.initial_opacity, device=device))  # [N,]
+        logit_opacities = torch.logit(
+            torch.full((num_gaussians,), optimizer_config.initial_opacity, device=device)
+        )  # [N,]
 
         rgbs = torch.from_numpy(training_dataset.points_rgb / 255.0).to(device=device, dtype=torch.float32)  # [N, 3]
         sh_0 = _rgb_to_sh(rgbs).unsqueeze(1)  # [N, 1, 3]
@@ -945,7 +1039,11 @@ class GaussianSplatReconstruction:
 
     @classmethod
     def _make_pose_optimizer(
-        cls, optimization_config: GaussianSplatReconstructionConfig, device: torch.device | str, num_images: int
+        cls,
+        optimization_config: GaussianSplatReconstructionConfig,
+        device: torch.device | str,
+        num_images: int,
+        num_steps_per_epoch: int,
     ) -> tuple[CameraPoseAdjustment, torch.optim.Adam, torch.optim.lr_scheduler.ExponentialLR]:
         """
         Create a camera pose adjustment model, optimizer, and scheduler if camera pose optimization is enabled in the config.
@@ -953,7 +1051,8 @@ class GaussianSplatReconstruction:
         Args:
             optimization_config (Config): Configuration object containing optimization parameters.
             device (torch.device | str): The device to run the model on (e.g., ``"cuda"`` or ``"cpu"``).
-            num_images (int): The number of images in the dataset.
+            num_images (int): The number of scene images to allocate pose entries for.
+            num_steps_per_epoch (int): The number of optimization steps in each training epoch.
 
         Returns:
             pose_adjust_model (CameraPoseAdjustment | None):
@@ -969,10 +1068,9 @@ class GaussianSplatReconstruction:
         # Module to adjust camera poses during training
         pose_adjust_model = CameraPoseAdjustment(num_images, init_std=optimization_config.pose_opt_init_std).to(device)
 
-        # Increase learning rate for pose optimization and add gradient clipping
         pose_adjust_optimizer = torch.optim.Adam(
             pose_adjust_model.parameters(),
-            lr=optimization_config.pose_opt_lr * 100.0,
+            lr=optimization_config.pose_opt_lr,
             weight_decay=optimization_config.pose_opt_reg,
         )
 
@@ -980,8 +1078,8 @@ class GaussianSplatReconstruction:
         torch.nn.utils.clip_grad_norm_(pose_adjust_model.parameters(), max_norm=1.0)
 
         # Add learning rate scheduler for pose optimization
-        pose_opt_start_step = int(optimization_config.pose_opt_start_epoch * num_images)
-        pose_opt_stop_step = int(optimization_config.pose_opt_stop_epoch * num_images)
+        pose_opt_start_step = int(optimization_config.pose_opt_start_epoch * num_steps_per_epoch)
+        pose_opt_stop_step = int(optimization_config.pose_opt_stop_epoch * num_steps_per_epoch)
         num_pose_opt_steps = max(1, pose_opt_stop_step - pose_opt_start_step)
         pose_adjust_scheduler = torch.optim.lr_scheduler.ExponentialLR(
             pose_adjust_optimizer, gamma=optimization_config.pose_opt_lr_decay ** (1.0 / num_pose_opt_steps)
@@ -1048,9 +1146,9 @@ class GaussianSplatReconstruction:
         )
 
         if self.config.batch_size > 1:
-            num_steps_per_epoch: int = np.ceil(len(self.training_dataset) / self.config.batch_size).astype(int)
+            num_steps_per_epoch = np.ceil(len(self.training_dataset) / self.config.batch_size).astype(int)
         else:
-            num_steps_per_epoch: int = len(self.training_dataset)
+            num_steps_per_epoch = len(self.training_dataset)
 
         # Calculate total steps, allowing max_steps to override the computed value
         computed_total_steps: int = int(self.config.max_epochs * num_steps_per_epoch)
@@ -1125,8 +1223,11 @@ class GaussianSplatReconstruction:
                         # After pose_opt_stop_iter, don't track gradients through pose adjustment
                         with torch.no_grad():
                             cam_to_world_mats = self.pose_adjust_model(cam_to_world_mats, image_ids)
+                    world_to_cam_mats = torch.linalg.inv(cam_to_world_mats).contiguous()
 
                 projection_mats = minibatch["projection"].to(self.device)  # [B, 3, 3]
+                camera_models = minibatch["camera_model"].to(self.device)
+                distortion_coeffs = minibatch["distortion_coeffs"].to(self.device)
                 image = minibatch["image"]  # [B, H, W, 3]
                 mask = minibatch["mask"] if "mask" in minibatch and not self.config.ignore_masks else None
                 image_height, image_width = image.shape[1:3]
@@ -1142,25 +1243,6 @@ class GaussianSplatReconstruction:
 
                 # Progressively use higher spherical harmonic degree as we optimize
                 sh_degree_to_use = min(self._global_step // increase_sh_degree_every_step, self.config.sh_degree)
-                projection_function = (
-                    self.model.project_gaussians_for_images_and_depths
-                    if self.config.sparse_depth_reg > 0
-                    else self.model.project_gaussians_for_images
-                )
-                projected_gaussians = projection_function(
-                    world_to_cam_mats,
-                    projection_mats,
-                    image_width,
-                    image_height,
-                    self.config.near_plane,
-                    self.config.far_plane,
-                    ProjectionType.PERSPECTIVE,
-                    sh_degree_to_use,
-                    self.config.min_radius_2d,
-                    self.config.eps_2d,
-                    self.config.antialias,
-                )
-
                 # If you have very large images, you can iterate over disjoint crops and accumulate gradients
                 # If self.optimization_config.crops_per_image is 1, then this just returns the image
                 for pixels, mask_pixels, crop, is_last in crop_image_batch(image, mask, self.config.crops_per_image):
@@ -1169,32 +1251,34 @@ class GaussianSplatReconstruction:
 
                     # Render an image from the gaussian splats
                     # possibly using a crop of the full image
-                    crop_origin_w, crop_origin_h, crop_w, crop_h = crop
-                    rendered_results, alphas = self.model.render_from_projected_gaussians(
-                        projected_gaussians,
-                        crop_w,
-                        crop_h,
-                        crop_origin_w,
-                        crop_origin_h,
-                        self.config.tile_size,
+                    render_outputs = self._render_backend.forward_train(
+                        model=self.model,
+                        config=self.config,
+                        world_to_camera_matrices=world_to_cam_mats,
+                        projection_matrices=projection_mats,
+                        camera_models=camera_models,
+                        distortion_coeffs=distortion_coeffs,
+                        image_width=image_width,
+                        image_height=image_height,
+                        sh_degree_to_use=sh_degree_to_use,
+                        crop=crop,
                     )
-
-                    colors = rendered_results[..., : self.model.num_channels]  # [1, H, W, 3]
+                    image = render_outputs.image
 
                     # If you want to add random background, we'll mix it in here
                     if self.config.random_bkgd:
                         bkgd = torch.rand(1, 3, device=self.device)
-                        colors = colors + bkgd * (1.0 - alphas)
+                        image = image + bkgd * (1.0 - render_outputs.alpha)
 
                     if mask_pixels is not None:
                         # set the ground truth pixel values to match render, thus loss is zero at mask pixels and not updated
                         mask_pixels = mask_pixels.to(self.device)
-                        pixels[~mask_pixels] = colors.detach()[~mask_pixels]
+                        pixels[~mask_pixels] = image.detach()[~mask_pixels]
 
                     # Image losses
-                    l1loss = nnf.l1_loss(colors, pixels)
+                    l1loss = nnf.l1_loss(image, pixels)
                     ssimloss = 1.0 - ssim(
-                        colors.permute(0, 3, 1, 2).contiguous(),
+                        image.permute(0, 3, 1, 2).contiguous(),
                         pixels.permute(0, 3, 1, 2).contiguous(),
                     )
                     loss = torch.lerp(l1loss, ssimloss, self.config.ssim_lambda)  # type: ignore
@@ -1206,14 +1290,16 @@ class GaussianSplatReconstruction:
                     if sparse_depth is not None and sparse_depth_uv is not None and median_depths is not None:
                         if self.config.batch_size > 1:
                             raise NotImplementedError("Sparse depth loss is not implemented for batch_size > 1.")
-                        if rendered_results.shape[-1] != self.model.num_channels + 1:
+                        if render_outputs.depth is None:
                             raise RuntimeError("Model did not render depth channel, but sparse depth loss is enabled.")
                         if sparse_depth_uv.numel() == 0:
                             depth_loss = 0.0
                         else:
-                            depth = rendered_results[..., -1]  # [1, H, W]
+                            depth = render_outputs.depth[..., 0]  # [1, H, W]
                             depth_uv = depth[:, sparse_depth_uv[0, :, 1], sparse_depth_uv[0, :, 0]]  # [B, N]
-                            alpha_uv = alphas[:, sparse_depth_uv[0, :, 1], sparse_depth_uv[0, :, 0], 0]  # [B, N]
+                            alpha_uv = render_outputs.alpha[
+                                :, sparse_depth_uv[0, :, 1], sparse_depth_uv[0, :, 0], 0
+                            ]  # [B, N]
                             pred_depth = depth_uv / torch.clamp(alpha_uv, min=1e-6)  # [B, N]
                             pred_depth = pred_depth / median_depths.unsqueeze(1)  # Normalize by median depth
                             sparse_depth = sparse_depth / median_depths.unsqueeze(1)  # Normalize by median depth
@@ -1382,6 +1468,8 @@ class GaussianSplatReconstruction:
         for i, data in pbar:
             world_to_cam_matrices = data["world_to_camera"].to(device)
             projection_matrices = data["projection"].to(device)
+            camera_models = data["camera_model"].to(device)
+            distortion_coeffs = data["distortion_coeffs"].to(device)
             ground_truth_image = data["image"].to(device) / 255.0
             mask_pixels = data["mask"] if "mask" in data and not self.config.ignore_masks else None
 
@@ -1390,22 +1478,20 @@ class GaussianSplatReconstruction:
             torch.cuda.synchronize()
             tic = time.time()
 
-            predicted_image, _ = self.model.render_images(
-                world_to_cam_matrices,
-                projection_matrices,
-                width,
-                height,
-                self.config.near_plane,
-                self.config.far_plane,
-                ProjectionType.PERSPECTIVE,
-                self.config.sh_degree,
-                self.config.tile_size,
-                self.config.min_radius_2d,
-                self.config.eps_2d,
-                self.config.antialias,
+            render_outputs = self._render_backend.forward_eval(
+                model=self.model,
+                config=self.config,
+                world_to_camera_matrices=world_to_cam_matrices,
+                projection_matrices=projection_matrices,
+                camera_models=camera_models,
+                distortion_coeffs=distortion_coeffs,
+                image_width=width,
+                image_height=height,
+                sh_degree_to_use=self.config.sh_degree,
             )
+            predicted_image = render_outputs.image
             predicted_image = torch.clamp(predicted_image, 0.0, 1.0)
-            # depths = colors[..., -1:] / alphas.clamp(min=1e-10)
+            # depths = image[..., -1:] / alpha.clamp(min=1e-10)
             # depths = (depths - depths.min()) / (depths.max() - depths.min())
             # depths = depths / depths.max()
 
